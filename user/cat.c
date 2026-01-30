@@ -72,10 +72,11 @@ main(int argc, char *argv[])
 {
   int fd, i;
 
-  if(argc <= 1){
-    cat(0, 0);
-    exit(0);
-  }
+  // if(argc <= 1){
+  //   cat(0, 0);
+  //   exit(0);
+  // }
+  int saw_file = 0;
 
   int print_line_num = 0;
   for (int i = 1; i < argc; ++i) {
@@ -94,7 +95,12 @@ main(int argc, char *argv[])
       exit(1);
     }
     cat(fd, print_line_num);
+    saw_file = 1;
     close(fd);
+  }
+
+  if (!saw_file) {
+    cat(0, print_line_num);
   }
   exit(0);
 }

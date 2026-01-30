@@ -60,13 +60,15 @@ int
 main(int argc, char *argv[])
 {
   int fd, i;
-
-  if(argc <= 1){
-    // wc(0, "");
-    exit(0);
-  } 
+  printf("Number of args: %d\n", argc);
+  // if(argc <= 1){
+  //   // wc(0, "");
+  //   wc(0, "", true, true, true);
+  //   // exit(0);
+    
+  // } 
   bool l = 0, w = 0, c = 0;
-
+  bool saw_file = false;
   for(i = 1; i < argc; i++){
     if (argv[i][0] == '-') {
       if (compareArg(argv[i], "-l")) l = true;
@@ -76,13 +78,22 @@ main(int argc, char *argv[])
   }
 
   if (!l && !w && !c) {
-    l = 1;
-    w = 1;
-    c = 1;
+    l = true;
+    w = true;
+    c = true;
   }
 
   for (int i = 1; i < argc; ++i) {
-    if (argv[i][0] == '-') continue;
+    // if (argv[i][0] == '-') continue;
+    if (argv[i][0] == '-') {
+      if (argv[i][1] == '\0') {
+        wc(0, "", l, w, c);
+        saw_file=true;
+      }
+      continue;
+    }
+    
+    saw_file = true;
 
     if((fd = open(argv[i], O_RDONLY)) < 0){
       printf("wc: cannot open %s\n", argv[i]);
@@ -90,7 +101,10 @@ main(int argc, char *argv[])
     }
     wc(fd, argv[i], l, w, c);
     close(fd);
-    
+  }
+
+  if(!saw_file) {
+    wc(0, "", l, w, c);
   }
   exit(0);
 }

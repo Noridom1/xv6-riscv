@@ -123,7 +123,7 @@ sys_trace(void)
 {
   int mask;
 
-  argint(0, &mask);   // no return value
+  argint(0, &mask);
   myproc()->tracemask = mask;
   return 0;
 }

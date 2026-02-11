@@ -705,12 +705,16 @@ getprocs(uint64 uptr)
   for(p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if(p->state != UNUSED) {
+      // Copy process info into the temporary proc.
       info.pid = p->pid;
       info.state = p->state;
       info.sz = p->sz;
       safestrcpy(info.name, p->name, sizeof(info.name));
+
+      // write the temporary process info into the caller's buffer.
       if(copyout(cur->pagetable, uptr + count * sizeof(info),
                  (char *)&info, sizeof(info)) < 0) {
+        // If fails, release the lock and return.
         release(&p->lock);
         return -1;
       }

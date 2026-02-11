@@ -60,7 +60,7 @@ int
 main(int argc, char *argv[])
 {
   int fd, i;
-  printf("Number of args: %d\n", argc);
+  // printf("Number of args: %d\n", argc);
   // if(argc <= 1){
   //   // wc(0, "");
   //   wc(0, "", true, true, true);

@@ -115,6 +115,7 @@ allocproc(void)
   for(p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if(p->state == UNUSED) {
+      p->tracemask = 0;
       goto found;
     } else {
       release(&p->lock);
@@ -279,6 +280,9 @@ kfork(void)
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
+
+  // inherit trace mask
+  np->tracemask = p->tracemask;
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;

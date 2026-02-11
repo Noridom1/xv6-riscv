@@ -117,3 +117,13 @@ sys_getprocs(void)
   argaddr(0, &uptr);
   return getprocs(uptr);
 }
+
+uint64
+sys_trace(void)
+{
+  int mask;
+
+  argint(0, &mask);   // no return value
+  myproc()->tracemask = mask;
+  return 0;
+}

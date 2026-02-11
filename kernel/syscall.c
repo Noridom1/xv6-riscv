@@ -102,6 +102,7 @@ extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
 extern uint64 sys_getprocs(void);
+extern uint64 sys_trace(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -127,7 +128,78 @@ static uint64 (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
-[SYS_getprocs] sys_getprocs
+[SYS_getprocs] sys_getprocs,
+[SYS_trace]   sys_trace
+};
+
+// void
+// syscall(void)
+// {
+//   int num;
+//   struct proc *p = myproc();
+
+//   num = p->trapframe->a7;
+//   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+//     // Use num to lookup the system call function for num, call it,
+//     // and store its return value in p->trapframe->a0
+//     p->trapframe->a0 = syscalls[num]();
+//   } else {
+//     printf("%d %s: unknown sys call %d\n",
+//             p->pid, p->name, num);
+//     p->trapframe->a0 = -1;
+//   }
+// }
+
+static char *syscallnames[] = {
+  [SYS_fork]     "fork",
+  [SYS_exit]     "exit",
+  [SYS_wait]     "wait",
+  [SYS_pipe]     "pipe",
+  [SYS_read]     "read",
+  [SYS_kill]     "kill",
+  [SYS_exec]     "exec",
+  [SYS_fstat]    "fstat",
+  [SYS_chdir]    "chdir",
+  [SYS_dup]      "dup",
+  [SYS_getpid]   "getpid",
+  [SYS_sbrk]     "sbrk",
+  [SYS_pause]    "pause",
+  [SYS_uptime]   "uptime",
+  [SYS_open]     "open",
+  [SYS_write]    "write",
+  [SYS_mknod]    "mknod",
+  [SYS_unlink]   "unlink",
+  [SYS_link]     "link",
+  [SYS_mkdir]    "mkdir",
+  [SYS_close]    "close",
+  [SYS_getprocs] "getprocs",
+  [SYS_trace]    "trace",
+};
+
+static int syscall_argc[] = {
+  [SYS_fork]     0,  // fork()
+  [SYS_exit]     1,  // exit(status)
+  [SYS_wait]     1,  // wait(&status)
+  [SYS_pipe]     1,  // pipe(fd[2])
+  [SYS_read]     3,  // read(fd, buf, n)
+  [SYS_kill]     1,  // kill(pid)
+  [SYS_exec]     2,  // exec(path, argv)
+  [SYS_fstat]    2,  // fstat(fd, &stat)
+  [SYS_chdir]    1,  // chdir(path)
+  [SYS_dup]      1,  // dup(fd)
+  [SYS_getpid]   0,  // getpid()
+  [SYS_sbrk]     1,  // sbrk(n)
+  [SYS_pause]    0,  // pause()
+  [SYS_uptime]   0,  // uptime()
+  [SYS_open]     2,  // open(path, mode)
+  [SYS_write]    3,  // write(fd, buf, n)
+  [SYS_mknod]    3,  // mknod(path, major, minor)
+  [SYS_unlink]   1,  // unlink(path)
+  [SYS_link]     2,  // link(old, new)
+  [SYS_mkdir]    1,  // mkdir(path)
+  [SYS_close]    1,  // close(fd)
+  [SYS_getprocs] 1,  // getprocs(&buf)
+  [SYS_trace]    1,  // trace(mask)
 };
 
 void
@@ -138,12 +210,32 @@ syscall(void)
 
   num = p->trapframe->a7;
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
-    // Use num to lookup the system call function for num, call it,
-    // and store its return value in p->trapframe->a0
+    // Get the arguments
+    uint64 args[6];
+    for(int i = 0; i < 6; i++)
+      args[i] = p->trapframe->a0 + i;
+
+    // Call the syscall
     p->trapframe->a0 = syscalls[num]();
+
+    if(p->tracemask & (1 << num)) {
+      printf("%d: syscall %s(",
+            p->pid,
+            syscallnames[num]);
+
+      int argc = syscall_argc[num];
+      for(int i = 0; i < argc; i++) {
+        if(i) printf(", ");
+        printf("%d", (int)args[i]);
+      }
+
+      printf(") -> %d\n", (int)p->trapframe->a0);
+    }
+
   } else {
     printf("%d %s: unknown sys call %d\n",
-            p->pid, p->name, num);
+           p->pid, p->name, num);
     p->trapframe->a0 = -1;
   }
 }
+

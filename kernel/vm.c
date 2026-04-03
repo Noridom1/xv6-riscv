@@ -8,6 +8,18 @@
 #include "proc.h"
 #include "fs.h"
 
+
+// Structure to track our single shared memory page
+struct {
+  uint64 pa;              // Physical address of the shared page
+  int refcount;           // Reference count
+  struct spinlock lock;   // Lock to protect access
+  int allocated;          // Whether the page is allocated
+} shmem_page;
+
+// Define a specific region for shared memory
+#define SHMEM_REGION 0x4000000  // 64MB mark
+
 /*
  * the kernel's page table.
  */
@@ -189,6 +201,28 @@ uvmcreate()
 // Remove npages of mappings starting from va. va must be
 // page-aligned. It's OK if the mappings don't exist.
 // Optionally free the physical memory.
+// void
+// uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+// {
+//   uint64 a;
+//   pte_t *pte;
+
+//   if((va % PGSIZE) != 0)
+//     panic("uvmunmap: not aligned");
+
+//   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+//     if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
+//       continue;   
+//     if((*pte & PTE_V) == 0)  // has physical page been allocated?
+//       continue;
+//     if(do_free){
+//       uint64 pa = PTE2PA(*pte);
+//       kfree((void*)pa);
+//     }
+//     *pte = 0;
+//   }
+// }
+
 void
 uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
@@ -199,16 +233,42 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     panic("uvmunmap: not aligned");
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
-    if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
-      continue;   
-    if((*pte & PTE_V) == 0)  // has physical page been allocated?
+    if((pte = walk(pagetable, a, 0)) == 0)
       continue;
-    if(do_free){
-      uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+    if((*pte & PTE_V) == 0)
+      continue;
+
+    uint64 pa = PTE2PA(*pte);
+
+    // SPECIAL CASE: shared memory
+    if(a == SHMEM_REGION){
+      acquire(&shmem_page.lock);
+
+      if(shmem_page.allocated && shmem_page.pa == pa){
+        shmem_page.refcount--;
+
+        if(shmem_page.refcount == 0){
+          kfree((void*)pa);
+          shmem_page.pa = 0;
+          shmem_page.allocated = 0;
+        }
+      }
+
+      release(&shmem_page.lock);
     }
+    else {
+      // NORMAL CASE
+      if(do_free){
+        kfree((void*)pa);
+      }
+    }
+
+    // Remove mapping
     *pte = 0;
   }
+
+  // Optional: flush TLB
+  sfence_vma();
 }
 
 // Allocate PTEs and physical memory to grow a process from oldsz to
@@ -282,6 +342,9 @@ freewalk(pagetable_t pagetable)
 void
 uvmfree(pagetable_t pagetable, uint64 sz)
 {
+  // Shared memory is mapped outside p->sz, so explicitly unmap it first.
+  uvmunmap(pagetable, SHMEM_REGION, 1, 1);
+
   if(sz > 0)
     uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
   freewalk(pagetable);
@@ -293,6 +356,8 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // physical memory.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
+
+/*
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
@@ -322,6 +387,73 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
+*/
+
+int
+uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+  char *mem;
+
+  for(i = 0; i < sz; i += PGSIZE){
+    if((pte = walk(old, i, 0)) == 0)
+      continue;
+    if((*pte & PTE_V) == 0)
+      continue;
+
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+
+    // SPECIAL CASE: shared memory region
+    if(i == SHMEM_REGION){
+      // map SAME physical page (no copy)
+      if(mappages(new, i, PGSIZE, pa, flags) != 0){
+        goto err;
+      }
+
+      // increment refcount
+      acquire(&shmem_page.lock);
+      shmem_page.refcount++;
+      release(&shmem_page.lock);
+
+      continue;
+    }
+
+    // NORMAL CASE: copy memory
+    if((mem = kalloc()) == 0)
+      goto err;
+
+    memmove(mem, (char*)pa, PGSIZE);
+
+    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+      kfree(mem);
+      goto err;
+    }
+  }
+
+  // SHMEM_REGION is outside p->sz, so the loop above may skip it.
+  pte = walk(old, SHMEM_REGION, 0);
+  if(pte && (*pte & PTE_V) && SHMEM_REGION >= sz){
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+
+    if(mappages(new, SHMEM_REGION, PGSIZE, pa, flags) != 0)
+      goto err;
+
+    acquire(&shmem_page.lock);
+    shmem_page.refcount++;
+    release(&shmem_page.lock);
+  }
+
+  return 0;
+
+err:
+  uvmunmap(new, 0, i / PGSIZE, 1);
+  return -1;
+}
+
 
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
@@ -484,3 +616,116 @@ ismapped(pagetable_t pagetable, uint64 va)
   }
   return 0;
 }
+
+void
+init_shmem(void)
+{
+  initlock(&shmem_page.lock, "shmem");
+  shmem_page.pa = 0;
+  shmem_page.refcount = 0;
+  shmem_page.allocated = 0;
+}
+
+uint64
+mmap(void)
+{
+  struct proc *p = myproc();
+
+  acquire(&shmem_page.lock);
+
+  // Case 1: first time allocation
+  if(shmem_page.allocated == 0){
+    char *mem = kalloc();
+    if(mem == 0){
+      release(&shmem_page.lock);
+      return 0;
+    }
+
+    memset(mem, 0, PGSIZE);
+
+    shmem_page.pa = (uint64)mem;
+    shmem_page.refcount = 1;
+    shmem_page.allocated = 1;
+  } else {
+    // Case 2: already exists
+    shmem_page.refcount++;
+  }
+
+  uint64 pa = shmem_page.pa;
+
+  release(&shmem_page.lock);
+
+  // Map into process page table
+  if(mappages(p->pagetable,
+              SHMEM_REGION,
+              PGSIZE,
+              pa,
+              PTE_R | PTE_W | PTE_U) != 0){
+
+    // mapping failed → rollback
+    acquire(&shmem_page.lock);
+
+    shmem_page.refcount--;
+    if(shmem_page.refcount == 0){
+      kfree((void*)shmem_page.pa);
+      shmem_page.pa = 0;
+      shmem_page.allocated = 0;
+    }
+
+    release(&shmem_page.lock);
+    return 0;
+  }
+
+  return SHMEM_REGION;
+}
+
+int
+munmap(uint64 addr)
+{
+  struct proc *p = myproc();
+
+  // 1. Validate address
+  if(addr != SHMEM_REGION)
+    return -1;
+
+  // 2. Find PTE
+  pte_t *pte = walk(p->pagetable, addr, 0);
+  if(pte == 0)
+    return -1;
+
+  // 3. Check if valid and mapped
+  if((*pte & PTE_V) == 0)
+    return -1;
+
+  // 4. Remove mapping (get physical address first)
+  uint64 pa = PTE2PA(*pte);
+
+  // Clear the PTE
+  *pte = 0;
+
+  // Optional but good practice: flush TLB
+  sfence_vma();
+
+  // 5. Update shared memory metadata
+  acquire(&shmem_page.lock);
+
+  // Sanity check (optional but safe)
+  if(shmem_page.allocated == 0 || shmem_page.pa != pa){
+    release(&shmem_page.lock);
+    return -1;
+  }
+
+  shmem_page.refcount--;
+
+  // 6. Free if last reference
+  if(shmem_page.refcount == 0){
+    kfree((void*)shmem_page.pa);
+    shmem_page.pa = 0;
+    shmem_page.allocated = 0;
+  }
+
+  release(&shmem_page.lock);
+
+  return 0;
+}
+

@@ -45,3 +45,5 @@ entry("pause");
 entry("uptime");
 entry("getprocs");  # int getprocs(uint64 user_buffer)
 entry("trace");
+entry("mmap");
+entry("munmap");

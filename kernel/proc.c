@@ -115,6 +115,7 @@ allocproc(void)
   for(p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if(p->state == UNUSED) {
+      // New processes start with tracing disabled.
       p->tracemask = 0;
       goto found;
     } else {
@@ -281,7 +282,7 @@ kfork(void)
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
-  // inherit trace mask
+  // Child inherits parent's trace settings.
   np->tracemask = p->tracemask;
 
   // Cause fork to return 0 in the child.
@@ -698,23 +699,28 @@ int
 getprocs(uint64 uptr)
 {
   struct proc *p;
+  // Caller's pagetable is needed for copyout() into user memory.
   struct proc *cur = myproc();
+  // Temporary kernel-side record copied out one process at a time.
   struct procinfo info;
+  // Number of entries successfully written to user buffer.
   int count = 0;
 
   for(p = proc; p < &proc[NPROC]; p++) {
+    // Hold each proc lock while reading its fields for a consistent snapshot.
     acquire(&p->lock);
     if(p->state != UNUSED) {
-      // Copy process info into the temporary proc.
+      // Build one procinfo record from kernel struct proc.
       info.pid = p->pid;
       info.state = p->state;
       info.sz = p->sz;
       safestrcpy(info.name, p->name, sizeof(info.name));
 
-      // write the temporary process info into the caller's buffer.
+      // Copy this record into user buffer at index count. 
+      // Need the caller's pagetable so that the kernel knows exactly which physical address to write to.
       if(copyout(cur->pagetable, uptr + count * sizeof(info),
                  (char *)&info, sizeof(info)) < 0) {
-        // If fails, release the lock and return.
+        // User pointer/buffer invalid: abort syscall with error.
         release(&p->lock);
         return -1;
       }

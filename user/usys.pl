@@ -16,6 +16,7 @@ sub entry {
 	print ".global $name\n";
 	print "$name:\n";
     }
+    # xv6 syscall ABI: place syscall number in a7, then trap with ecall.
     print " li a7, SYS_${name}\n";
     print " ecall\n";
     print " ret\n";
@@ -42,5 +43,5 @@ entry("getpid");
 entry("sbrk");
 entry("pause");
 entry("uptime");
-entry("getprocs");
+entry("getprocs");  # int getprocs(uint64 user_buffer)
 entry("trace");

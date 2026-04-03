@@ -208,16 +208,19 @@ syscall(void)
   int num;
   struct proc *p = myproc();
 
+  // User code places syscall number in a7 before ecall.
   num = p->trapframe->a7;
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
-    // Get the arguments
+    // Snapshot raw arguments before handler runs, so printed args
+    // correspond to what user passed in.
     uint64 args[6];
     for(int i = 0; i < 6; i++)
       args[i] = p->trapframe->a0 + i;
 
-    // Call the syscall
+    // Dispatch syscall and place return value in a0.
     p->trapframe->a0 = syscalls[num]();
 
+    // Print only if the bit for this syscall number is enabled.
     if(p->tracemask & (1 << num)) {
       printf("%d: syscall %s(",
             p->pid,

@@ -114,7 +114,9 @@ sys_getprocs(void)
 {
   uint64 uptr;
 
+  // Fetch user virtual address of destination buffer from arg0.
   argaddr(0, &uptr);
+  // Delegate the table walk/copy logic to proc.c.
   return getprocs(uptr);
 }
 
@@ -123,7 +125,9 @@ sys_trace(void)
 {
   int mask;
 
+  // trace(mask): bit i enables logging for syscall number i.
   argint(0, &mask);
+  // Store per-process tracing configuration.
   myproc()->tracemask = mask;
   return 0;
 }

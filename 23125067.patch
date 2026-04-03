@@ -1,0 +1,687 @@
+diff --git a/.gitignore b/.gitignore
+index aebb7d2..50939b6 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -16,3 +16,5 @@ kernel/kernel
+ user/usys.S
+ .gdbinit
+ TAGS
++key
++key.pub
+diff --git a/Makefile b/Makefile
+index b262c0a..0c282a3 100644
+--- a/Makefile
++++ b/Makefile
+@@ -145,9 +145,12 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_hello\
++	$U/_ps\
++	$U/_trace
+ 
+-fs.img: mkfs/mkfs README $(UPROGS)
+-	mkfs/mkfs fs.img README $(UPROGS)
++fs.img: mkfs/mkfs README domains.txt $(UPROGS)
++	mkfs/mkfs fs.img README domains.txt $(UPROGS)
+ 
+ -include kernel/*.d user/*.d
+ 
+diff --git a/domains.txt b/domains.txt
+new file mode 100644
+index 0000000..a82ecaa
+--- /dev/null
++++ b/domains.txt
+@@ -0,0 +1,4 @@
++[google.com, 142.251.46.174]
++[usfca.edu, 23.185.0.2]
++[mit.edu, 104.90.21.210]
++[openai.com, 13.107.238.57]
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 122d9ca..c69afce 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -101,6 +101,8 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             getprocs(uint64);
++uint64          sys_getprocs(void);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/getproc.h b/kernel/getproc.h
+new file mode 100644
+index 0000000..eacd45c
+--- /dev/null
++++ b/kernel/getproc.h
+@@ -0,0 +1,18 @@
++#ifndef GETPROC_H
++#define GETPROC_H
++
++// Process states
++#ifndef PROCSTATE_ENUM
++#define PROCSTATE_ENUM
++enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
++#endif
++
++// Structure to hold process information
++struct procinfo {
++  int pid;                // Process ID
++  enum procstate state;   // Process state
++  uint64 sz;              // Size of process memory (bytes)
++  char name[16];          // Process name
++};
++
++#endif
+\ No newline at end of file
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22a5401..50110c9 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -4,6 +4,7 @@
+ #include "riscv.h"
+ #include "spinlock.h"
+ #include "proc.h"
++#include "getproc.h"
+ #include "defs.h"
+ 
+ struct cpu cpus[NCPU];
+@@ -114,6 +115,7 @@ allocproc(void)
+   for(p = proc; p < &proc[NPROC]; p++) {
+     acquire(&p->lock);
+     if(p->state == UNUSED) {
++      p->tracemask = 0;
+       goto found;
+     } else {
+       release(&p->lock);
+@@ -279,6 +281,9 @@ kfork(void)
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+ 
++  // inherit trace mask
++  np->tracemask = p->tracemask;
++
+   // Cause fork to return 0 in the child.
+   np->trapframe->a0 = 0;
+ 
+@@ -688,3 +693,35 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++int
++getprocs(uint64 uptr)
++{
++  struct proc *p;
++  struct proc *cur = myproc();
++  struct procinfo info;
++  int count = 0;
++
++  for(p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if(p->state != UNUSED) {
++      // Copy process info into the temporary proc.
++      info.pid = p->pid;
++      info.state = p->state;
++      info.sz = p->sz;
++      safestrcpy(info.name, p->name, sizeof(info.name));
++
++      // write the temporary process info into the caller's buffer.
++      if(copyout(cur->pagetable, uptr + count * sizeof(info),
++                 (char *)&info, sizeof(info)) < 0) {
++        // If fails, release the lock and return.
++        release(&p->lock);
++        return -1;
++      }
++      count++;
++    }
++    release(&p->lock);
++  }
++
++  return count;
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..f26668e 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -79,7 +79,10 @@ struct trapframe {
+   /* 280 */ uint64 t6;
+ };
+ 
++#ifndef PROCSTATE_ENUM
++#define PROCSTATE_ENUM
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
++#endif
+ 
+ // Per-process state
+ struct proc {
+@@ -91,6 +94,8 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  int tracemask;
++
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 076d965..50bc200 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_getprocs(void);
++extern uint64 sys_trace(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +128,78 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_getprocs] sys_getprocs,
++[SYS_trace]   sys_trace
++};
++
++// void
++// syscall(void)
++// {
++//   int num;
++//   struct proc *p = myproc();
++
++//   num = p->trapframe->a7;
++//   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
++//     // Use num to lookup the system call function for num, call it,
++//     // and store its return value in p->trapframe->a0
++//     p->trapframe->a0 = syscalls[num]();
++//   } else {
++//     printf("%d %s: unknown sys call %d\n",
++//             p->pid, p->name, num);
++//     p->trapframe->a0 = -1;
++//   }
++// }
++
++static char *syscallnames[] = {
++  [SYS_fork]     "fork",
++  [SYS_exit]     "exit",
++  [SYS_wait]     "wait",
++  [SYS_pipe]     "pipe",
++  [SYS_read]     "read",
++  [SYS_kill]     "kill",
++  [SYS_exec]     "exec",
++  [SYS_fstat]    "fstat",
++  [SYS_chdir]    "chdir",
++  [SYS_dup]      "dup",
++  [SYS_getpid]   "getpid",
++  [SYS_sbrk]     "sbrk",
++  [SYS_pause]    "pause",
++  [SYS_uptime]   "uptime",
++  [SYS_open]     "open",
++  [SYS_write]    "write",
++  [SYS_mknod]    "mknod",
++  [SYS_unlink]   "unlink",
++  [SYS_link]     "link",
++  [SYS_mkdir]    "mkdir",
++  [SYS_close]    "close",
++  [SYS_getprocs] "getprocs",
++  [SYS_trace]    "trace",
++};
++
++static int syscall_argc[] = {
++  [SYS_fork]     0,  // fork()
++  [SYS_exit]     1,  // exit(status)
++  [SYS_wait]     1,  // wait(&status)
++  [SYS_pipe]     1,  // pipe(fd[2])
++  [SYS_read]     3,  // read(fd, buf, n)
++  [SYS_kill]     1,  // kill(pid)
++  [SYS_exec]     2,  // exec(path, argv)
++  [SYS_fstat]    2,  // fstat(fd, &stat)
++  [SYS_chdir]    1,  // chdir(path)
++  [SYS_dup]      1,  // dup(fd)
++  [SYS_getpid]   0,  // getpid()
++  [SYS_sbrk]     1,  // sbrk(n)
++  [SYS_pause]    0,  // pause()
++  [SYS_uptime]   0,  // uptime()
++  [SYS_open]     2,  // open(path, mode)
++  [SYS_write]    3,  // write(fd, buf, n)
++  [SYS_mknod]    3,  // mknod(path, major, minor)
++  [SYS_unlink]   1,  // unlink(path)
++  [SYS_link]     2,  // link(old, new)
++  [SYS_mkdir]    1,  // mkdir(path)
++  [SYS_close]    1,  // close(fd)
++  [SYS_getprocs] 1,  // getprocs(&buf)
++  [SYS_trace]    1,  // trace(mask)
+ };
+ 
+ void
+@@ -136,12 +210,32 @@ syscall(void)
+ 
+   num = p->trapframe->a7;
+   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+-    // Use num to lookup the system call function for num, call it,
+-    // and store its return value in p->trapframe->a0
++    // Get the arguments
++    uint64 args[6];
++    for(int i = 0; i < 6; i++)
++      args[i] = p->trapframe->a0 + i;
++
++    // Call the syscall
+     p->trapframe->a0 = syscalls[num]();
++
++    if(p->tracemask & (1 << num)) {
++      printf("%d: syscall %s(",
++            p->pid,
++            syscallnames[num]);
++
++      int argc = syscall_argc[num];
++      for(int i = 0; i < argc; i++) {
++        if(i) printf(", ");
++        printf("%d", (int)args[i]);
++      }
++
++      printf(") -> %d\n", (int)p->trapframe->a0);
++    }
++
+   } else {
+     printf("%d %s: unknown sys call %d\n",
+-            p->pid, p->name, num);
++           p->pid, p->name, num);
+     p->trapframe->a0 = -1;
+   }
+ }
++
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 3dd926d..a7b7b36 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_getprocs 22
++#define SYS_trace 23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 419e727..de9495a 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -107,3 +107,23 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++// get processes
++uint64
++sys_getprocs(void)
++{
++  uint64 uptr;
++
++  argaddr(0, &uptr);
++  return getprocs(uptr);
++}
++
++uint64
++sys_trace(void)
++{
++  int mask;
++
++  argint(0, &mask);
++  myproc()->tracemask = mask;
++  return 0;
++}
+diff --git a/user/cat.c b/user/cat.c
+index 6d873a9..5bffb69 100644
+--- a/user/cat.c
++++ b/user/cat.c
+@@ -1,43 +1,87 @@
+ #include "kernel/types.h"
+ #include "kernel/fcntl.h"
+ #include "user/user.h"
++#include <stdbool.h>
+ 
+ char buf[512];
+ 
+ void
+-cat(int fd)
++cat(int fd, int print_line_num, int *line_num)
+ {
+   int n;
++  int at_line_start = 1;
+ 
+-  while((n = read(fd, buf, sizeof(buf))) > 0) {
+-    if (write(1, buf, n) != n) {
+-      fprintf(2, "cat: write error\n");
+-      exit(1);
++  while ((n = read(fd, buf, sizeof(buf))) > 0) {
++    for (int i = 0; i < n; i++) {
++      if (print_line_num && at_line_start) {
++        printf("%d\t", (*line_num)++);
++        at_line_start = 0;
++      }
++
++      if (write(1, &buf[i], 1) != 1) {
++        fprintf(2, "cat: write error\n");
++        exit(1);
++      }
++
++      if (buf[i] == '\n')
++        at_line_start = 1;
+     }
+   }
+-  if(n < 0){
++
++  if (n < 0) {
+     fprintf(2, "cat: read error\n");
+     exit(1);
+   }
+ }
+ 
++
++bool
++compareArg(const char *inp, const char *arg) 
++{
++  while (*inp && *arg) {
++    if (*inp != *arg) return 0;
++    inp++;
++    arg++;
++  }
++  return *inp == *arg;
++}
++
+ int
+ main(int argc, char *argv[])
+ {
+-  int fd, i;
++  int fd;
++  int print_line_num = 0;
++  int saw_file = 0;
++  int line_num = 1; 
+ 
+-  if(argc <= 1){
+-    cat(0);
+-    exit(0);
++  // Parse options
++  for (int i = 1; i < argc; i++) {
++    if (compareArg(argv[i], "-n"))
++      print_line_num = 1;
++    else if (argv[i][0] == '-') {
++      fprintf(2, "cat: unknown option %s\n", argv[i]);
++      exit(1);
++    }
+   }
+ 
+-  for(i = 1; i < argc; i++){
+-    if((fd = open(argv[i], O_RDONLY)) < 0){
++  // Process files
++  for (int i = 1; i < argc; i++) {
++    if (argv[i][0] == '-')
++      continue;
++
++    if ((fd = open(argv[i], O_RDONLY)) < 0) {
+       fprintf(2, "cat: cannot open %s\n", argv[i]);
+       exit(1);
+     }
+-    cat(fd);
++
++    cat(fd, print_line_num, &line_num);
+     close(fd);
++    saw_file = 1;
+   }
++
++  // stdin
++  if (!saw_file)
++    cat(0, print_line_num, &line_num);
++
+   exit(0);
+ }
+diff --git a/user/hello.c b/user/hello.c
+new file mode 100644
+index 0000000..457a7e5
+--- /dev/null
++++ b/user/hello.c
+@@ -0,0 +1,8 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++int main(int argc, char *argv[])
++{
++    printf("Hello, xv6!\n");
++    exit(0);
++}
+\ No newline at end of file
+diff --git a/user/ps.c b/user/ps.c
+new file mode 100644
+index 0000000..1080f84
+--- /dev/null
++++ b/user/ps.c
+@@ -0,0 +1,29 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/getproc.h"
++
++int
++main(void)
++{
++  struct procinfo procs[64];
++  int n = getprocs((uint64)procs);
++  
++  if(n < 0) {
++    printf("getprocs failed\n");
++    exit(1);
++  }
++  
++  const char* state_names[] = {"unused", "used", "sleep", "runble", "run", "zombie"};
++
++  printf("PID\tSTATE\tSIZE\tNAME\n");
++  for(int i = 0; i < n; i++) {
++    printf("%d\t%s\t%d\t%s\n",
++           procs[i].pid,
++           state_names[procs[i].state],
++           (int)procs[i].sz,
++           procs[i].name);
++  }
++  
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/trace.c b/user/trace.c
+new file mode 100644
+index 0000000..b600e4f
+--- /dev/null
++++ b/user/trace.c
+@@ -0,0 +1,27 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  int i;
++  char *nargv[MAXARG];
++
++  if(argc < 3 || (argv[1][0] < '0' || argv[1][0] > '9')){
++    fprintf(2, "Usage: %s mask command\n", argv[0]);
++    exit(1);
++  }
++
++  if (trace(atoi(argv[1])) < 0) {
++    fprintf(2, "%s: trace failed\n", argv[0]);
++    exit(1);
++  }
++ 
++  for(i = 2; i < argc && i < MAXARG; i++){
++    nargv[i-2] = argv[i];
++  }
++  exec(nargv[0], nargv);
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index ac84de9..272b0e6 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,8 @@ int getpid(void);
+ char* sys_sbrk(int,int);
+ int pause(int);
+ int uptime(void);
++int getprocs(uint64);
++int trace(int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..484cd1c 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("getprocs");
++entry("trace");
+\ No newline at end of file
+diff --git a/user/wc.c b/user/wc.c
+index d8f3b2a..e2caa3e 100644
+--- a/user/wc.c
++++ b/user/wc.c
+@@ -2,54 +2,113 @@
+ #include "kernel/stat.h"
+ #include "kernel/fcntl.h"
+ #include "user/user.h"
++#include <stdbool.h>
+ 
+ char buf[512];
+ 
++bool
++compareArg(const char *a, const char *b)
++{
++  while (*a && *b) {
++    if (*a != *b)
++      return false;
++    a++;
++    b++;
++  }
++  return *a == *b;
++}
++
+ void
+-wc(int fd, char *name)
++printResult(int l, int w, int c, const char *name,
++            bool cnt_l, bool cnt_w, bool cnt_c)
+ {
+-  int i, n;
+-  int l, w, c, inword;
++  if (cnt_l) printf("%d ", l);
++  if (cnt_w) printf("%d ", w);
++  if (cnt_c) printf("%d ", c);
++  if (name[0])
++    printf("%s", name);
++  printf("\n");
++}
+ 
+-  l = w = c = 0;
+-  inword = 0;
+-  while((n = read(fd, buf, sizeof(buf))) > 0){
+-    for(i=0; i<n; i++){
++void
++wc(int fd, const char *name, bool cnt_l, bool cnt_w, bool cnt_c)
++{
++  int n;
++  int l = 0, w = 0, c = 0;
++  int inword = 0;
++
++  while ((n = read(fd, buf, sizeof(buf))) > 0) {
++    for (int i = 0; i < n; i++) {
+       c++;
+-      if(buf[i] == '\n')
++
++      if (buf[i] == '\n')
+         l++;
+-      if(strchr(" \r\t\n\v", buf[i]))
++
++      if (buf[i] == ' ' || buf[i] == '\n' || buf[i] == '\t' ||
++          buf[i] == '\r' || buf[i] == '\v') {
+         inword = 0;
+-      else if(!inword){
++      } else if (!inword) {
+         w++;
+         inword = 1;
+       }
+     }
+   }
+-  if(n < 0){
+-    printf("wc: read error\n");
++
++  if (n < 0) {
++    fprintf(2, "wc: read error\n");
+     exit(1);
+   }
+-  printf("%d %d %d %s\n", l, w, c, name);
++
++  printResult(l, w, c, name, cnt_l, cnt_w, cnt_c);
+ }
+ 
+ int
+ main(int argc, char *argv[])
+ {
+-  int fd, i;
++  int fd;
++  bool cnt_l = false, cnt_w = false, cnt_c = false;
++  bool saw_file = false;
++
++  // Parse options
++  for (int i = 1; i < argc; i++) {
++    if (argv[i][0] != '-')
++      continue;
+ 
+-  if(argc <= 1){
+-    wc(0, "");
+-    exit(0);
++    if (compareArg(argv[i], "-l")) cnt_l = true;
++    else if (compareArg(argv[i], "-w")) cnt_w = true;
++    else if (compareArg(argv[i], "-c")) cnt_c = true;
++    else {
++      fprintf(2, "wc: unknown option %s\n", argv[i]);
++      exit(1);
++    }
+   }
+ 
+-  for(i = 1; i < argc; i++){
+-    if((fd = open(argv[i], O_RDONLY)) < 0){
+-      printf("wc: cannot open %s\n", argv[i]);
++  // Default: -l -w -c
++  if (!cnt_l && !cnt_w && !cnt_c)
++    cnt_l = cnt_w = cnt_c = true;
++
++  // Process files
++  for (int i = 1; i < argc; i++) {
++    if (argv[i][0] == '-') {
++      if (argv[i][1] == '\0') {
++        wc(0, "", cnt_l, cnt_w, cnt_c);
++        saw_file = true;
++      }
++      continue;
++    }
++
++    if ((fd = open(argv[i], O_RDONLY)) < 0) {
++      fprintf(2, "wc: cannot open %s\n", argv[i]);
+       exit(1);
+     }
+-    wc(fd, argv[i]);
++
++    wc(fd, argv[i], cnt_l, cnt_w, cnt_c);
+     close(fd);
++    saw_file = true;
+   }
++
++  if (!saw_file)
++    wc(0, "", cnt_l, cnt_w, cnt_c);
++
+   exit(0);
+ }

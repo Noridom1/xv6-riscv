@@ -2,63 +2,162 @@
 #include "kernel/stat.h"
 #include "user/user.h"
 
+void
+delay(int ticks)
+{
+  int start = uptime();
+  while(uptime() - start < ticks)
+    ;
+}
+
+void
+test_basic()
+{
+  printf("TEST 1: basic mmap\n");
+
+  char *p = (char*) mmap();
+  if(p == 0){
+    printf("FAIL: mmap returned null\n");
+    exit(1);
+  }
+
+  *p = 42;
+  if(*p != 42){
+    printf("FAIL: write/read mismatch\n");
+    exit(1);
+  }
+
+  printf("PASS\n");
+  munmap((uint64)p);
+}
+
+void
+test_fork_shared()
+{
+  printf("TEST 2: fork shared memory\n");
+
+  char *p = (char*) mmap();
+  *p = 10;
+
+  int pid = fork();
+  if(pid == 0){
+    *p = 99;
+    exit(0);
+  }
+
+  wait(0);
+
+  if(*p == 99){
+    printf("PASS\n");
+  } else {
+    printf("FAIL: expected 99, got %d\n", *p);
+    exit(1);
+  }
+
+  munmap((uint64)p);
+}
+
+void
+test_child_munmap()
+{
+  printf("TEST 3: child munmap\n");
+
+  char *p = (char*) mmap();
+  *p = 55;
+
+  int pid = fork();
+  if(pid == 0){
+    munmap((uint64)p);
+    exit(0);
+  }
+
+  wait(0);
+
+  if(*p == 55){
+    printf("PASS\n");
+  } else {
+    printf("FAIL: memory corrupted\n");
+    exit(1);
+  }
+
+  munmap((uint64)p);
+}
+
+void
+test_parent_munmap_first()
+{
+  printf("TEST 4: parent munmap first\n");
+
+  char *p = (char*) mmap();
+  *p = 77;
+
+  int pid = fork();
+  if(pid == 0){
+    delay(10); // ensure parent unmaps first
+    if(*p == 77){
+      printf("PASS (child still sees value)\n");
+    } else {
+      printf("FAIL: child memory broken\n");
+    }
+    exit(0);
+  }
+
+  munmap((uint64)p);
+  wait(0);
+}
+
+void
+test_exit_cleanup()
+{
+  printf("TEST 5: exit cleanup\n");
+
+  int pid = fork();
+  if(pid == 0){
+    char *p = (char*) mmap();
+    *p = 33;
+    exit(0);
+  }
+
+  wait(0);
+  printf("PASS (no crash)\n");
+}
+
+void
+test_stress()
+{
+  printf("TEST 6: stress fork\n");
+
+  char *p = (char*) mmap();
+  *p = 1;
+
+  for(int i = 0; i < 5; i++){
+    int pid = fork();
+    if(pid == 0){
+      *p += 1;
+      exit(0);
+    }
+  }
+
+  for(int i = 0; i < 5; i++){
+    wait(0);
+  }
+
+  printf("Final value: %d (should be >= 1)\n", *p);
+  munmap((uint64)p);
+}
+
 int
 main(int argc, char *argv[])
 {
-  int pid;
-  uint64 shared_addr;
+  printf("=== MMAP TEST START ===\n");
 
-  printf("Testing mmap shared memory...\n");
+  test_basic();
+  test_fork_shared();
+  test_child_munmap();
+  test_parent_munmap_first();
+  test_exit_cleanup();
+  test_stress();
 
-  // Map shared memory
-  shared_addr = mmap();
-  if(shared_addr == 0){
-    printf("mmap failed\n");
-    exit(1);
-  }
-
-  printf("Mapped shared memory at 0x%p\n", (void*)shared_addr);
-
-  // Write to shared memory
-  int *shared_data = (int*)shared_addr;
-  *shared_data = 42;
-  printf("Parent wrote: %d\n", *shared_data);
-
-  // Fork a child process
-  pid = fork();
-  if(pid < 0){
-    printf("fork failed\n");
-    exit(1);
-  }
-
-  if(pid == 0){
-    // Child process
-    printf("Child read: %d\n", *shared_data);
-
-    // Modify the shared data
-    *shared_data = 100;
-    printf("Child wrote: %d\n", *shared_data);
-
-    // Test unmapping in child
-    if(munmap(shared_addr) < 0)
-      printf("Child: munmap failed\n");
-    else
-      printf("Child: munmap succeeded\n");
-
-    exit(0);
-  } else {
-    // Parent process
-    wait(0);
-
-    // Verify the child's modification is visible
-    printf("Parent read after child: %d\n", *shared_data);
-
-    // Unmap shared memory
-    if(munmap(shared_addr) < 0)
-      printf("Parent: munmap failed\n");
-    else
-      printf("Parent: munmap succeeded\n");
-  }
-
+  printf("=== ALL TESTS DONE ===\n");
   exit(0);
 }

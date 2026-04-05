@@ -9,13 +9,14 @@
 #include "fs.h"
 
 
-// Structure to track our single shared memory page
+// // Structure to track our single shared memory page
 struct {
   uint64 pa;              // Physical address of the shared page
   int refcount;           // Reference count
   struct spinlock lock;   // Lock to protect access
   int allocated;          // Whether the page is allocated
 } shmem_page;
+
 
 // Define a specific region for shared memory
 #define SHMEM_REGION 0x4000000  // 64MB mark
@@ -240,34 +241,16 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
     uint64 pa = PTE2PA(*pte);
 
-    // SPECIAL CASE: shared memory
-    if(a == SHMEM_REGION){
-      acquire(&shmem_page.lock);
-
-      if(shmem_page.allocated && shmem_page.pa == pa){
-        shmem_page.refcount--;
-
-        if(shmem_page.refcount == 0){
-          kfree((void*)pa);
-          shmem_page.pa = 0;
-          shmem_page.allocated = 0;
-        }
-      }
-
-      release(&shmem_page.lock);
-    }
-    else {
-      // NORMAL CASE
-      if(do_free){
-        kfree((void*)pa);
-      }
-    }
+    // Free only if no process still tracks this physical page as mmap.
+    // For non-mmap pages, mmap_pa_in_use(pa) is false and we free normally.
+    if(do_free && pa != 0 && !mmap_pa_in_use(pa))
+      kfree((void*)pa);
 
     // Remove mapping
     *pte = 0;
   }
 
-  // Optional: flush TLB
+  // Flush TLB
   sfence_vma();
 }
 
@@ -389,6 +372,71 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 }
 */
 
+// int
+// uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+// {
+//   pte_t *pte;
+//   uint64 pa, i;
+//   uint flags;
+//   char *mem;
+
+//   for(i = 0; i < sz; i += PGSIZE){
+//     if((pte = walk(old, i, 0)) == 0)
+//       continue;
+//     if((*pte & PTE_V) == 0)
+//       continue;
+
+//     pa = PTE2PA(*pte);
+//     flags = PTE_FLAGS(*pte);
+
+//     // SPECIAL CASE: shared memory region
+//     if(i == SHMEM_REGION){
+//       // map SAME physical page (no copy)
+//       if(mappages(new, i, PGSIZE, pa, flags) != 0){
+//         goto err;
+//       }
+
+//       // increment refcount
+//       acquire(&shmem_page.lock);
+//       shmem_page.refcount++;
+//       release(&shmem_page.lock);
+
+//       continue;
+//     }
+
+//     // NORMAL CASE: copy memory
+//     if((mem = kalloc()) == 0)
+//       goto err;
+
+//     memmove(mem, (char*)pa, PGSIZE);
+
+//     if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+//       kfree(mem);
+//       goto err;
+//     }
+//   }
+
+//   // SHMEM_REGION is outside p->sz, so the loop above may skip it.
+//   pte = walk(old, SHMEM_REGION, 0);
+//   if(pte && (*pte & PTE_V) && SHMEM_REGION >= sz){
+//     pa = PTE2PA(*pte);
+//     flags = PTE_FLAGS(*pte);
+
+//     if(mappages(new, SHMEM_REGION, PGSIZE, pa, flags) != 0)
+//       goto err;
+
+//     acquire(&shmem_page.lock);
+//     shmem_page.refcount++;
+//     release(&shmem_page.lock);
+//   }
+
+//   return 0;
+
+// err:
+//   uvmunmap(new, 0, i / PGSIZE, 1);
+//   return -1;
+// }
+
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
@@ -396,6 +444,8 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   uint64 pa, i;
   uint flags;
   char *mem;
+
+  struct proc *p = myproc();   // parent
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -406,22 +456,26 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
 
-    // SPECIAL CASE: shared memory region
-    if(i == SHMEM_REGION){
-      // map SAME physical page (no copy)
-      if(mappages(new, i, PGSIZE, pa, flags) != 0){
-        goto err;
+    // ✅ CHECK: is this mmap region?
+    int is_mmap = 0;
+    for(int j = 0; j < MAX_MMAP; j++){
+      if(p->mmaps[j].used &&
+        i >= p->mmaps[j].va &&
+        i < p->mmaps[j].va + PGSIZE){
+        is_mmap = 1;
+        break;
       }
+    }
 
-      // increment refcount
-      acquire(&shmem_page.lock);
-      shmem_page.refcount++;
-      release(&shmem_page.lock);
+    if(is_mmap){
+      // ✅ SHARE page (no copy)
+      if(mappages(new, i, PGSIZE, pa, flags) != 0)
+        goto err;
 
       continue;
     }
 
-    // NORMAL CASE: copy memory
+    // ✅ NORMAL: copy memory
     if((mem = kalloc()) == 0)
       goto err;
 
@@ -433,27 +487,12 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     }
   }
 
-  // SHMEM_REGION is outside p->sz, so the loop above may skip it.
-  pte = walk(old, SHMEM_REGION, 0);
-  if(pte && (*pte & PTE_V) && SHMEM_REGION >= sz){
-    pa = PTE2PA(*pte);
-    flags = PTE_FLAGS(*pte);
-
-    if(mappages(new, SHMEM_REGION, PGSIZE, pa, flags) != 0)
-      goto err;
-
-    acquire(&shmem_page.lock);
-    shmem_page.refcount++;
-    release(&shmem_page.lock);
-  }
-
   return 0;
 
 err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
-
 
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
@@ -626,106 +665,190 @@ init_shmem(void)
   shmem_page.allocated = 0;
 }
 
+// uint64
+// mmap(void)
+// {
+//   struct proc *p = myproc();
+
+//   acquire(&shmem_page.lock);
+
+//   // Case 1: first time allocation
+//   if(shmem_page.allocated == 0){
+//     char *mem = kalloc();
+//     if(mem == 0){
+//       release(&shmem_page.lock);
+//       return 0;
+//     }
+
+//     memset(mem, 0, PGSIZE);
+
+//     shmem_page.pa = (uint64)mem;
+//     shmem_page.refcount = 1;
+//     shmem_page.allocated = 1;
+//   } else {
+//     // Case 2: already exists
+//     shmem_page.refcount++;
+//   }
+
+//   uint64 pa = shmem_page.pa;
+
+//   release(&shmem_page.lock);
+
+//   // Map into process page table
+//   if(mappages(p->pagetable,
+//               SHMEM_REGION,
+//               PGSIZE,
+//               pa,
+//               PTE_R | PTE_W | PTE_U) != 0){
+
+//     // mapping failed → rollback
+//     acquire(&shmem_page.lock);
+
+//     shmem_page.refcount--;
+//     if(shmem_page.refcount == 0){
+//       kfree((void*)shmem_page.pa);
+//       shmem_page.pa = 0;
+//       shmem_page.allocated = 0;
+//     }
+
+//     release(&shmem_page.lock);
+//     return 0;
+//   }
+
+//   return SHMEM_REGION;
+// }
+
 uint64
 mmap(void)
 {
   struct proc *p = myproc();
 
-  acquire(&shmem_page.lock);
-
-  // Case 1: first time allocation
-  if(shmem_page.allocated == 0){
-    char *mem = kalloc();
-    if(mem == 0){
-      release(&shmem_page.lock);
-      return 0;
+  // 1. Find a free mmap slot
+  int idx = -1;
+  for(int i = 0; i < MAX_MMAP; i++){
+    if(p->mmaps[i].used == 0){
+      idx = i;
+      break;
     }
-
-    memset(mem, 0, PGSIZE);
-
-    shmem_page.pa = (uint64)mem;
-    shmem_page.refcount = 1;
-    shmem_page.allocated = 1;
-  } else {
-    // Case 2: already exists
-    shmem_page.refcount++;
   }
 
-  uint64 pa = shmem_page.pa;
+  if(idx == -1)
+    return 0; // no free slot
 
-  release(&shmem_page.lock);
+  // 2. Choose virtual address (simple: grow from p->sz)
+  uint64 va = PGROUNDUP(p->sz);
+  p->sz = va + PGSIZE;
 
-  // Map into process page table
-  if(mappages(p->pagetable,
-              SHMEM_REGION,
-              PGSIZE,
-              pa,
+  // 3. Allocate physical page
+  char *mem = kalloc();
+  if(mem == 0)
+    return 0;
+
+  memset(mem, 0, PGSIZE);
+
+  uint64 pa = (uint64)mem;
+
+  // 4. Map into page table
+  if(mappages(p->pagetable, va, PGSIZE, pa,
               PTE_R | PTE_W | PTE_U) != 0){
-
-    // mapping failed → rollback
-    acquire(&shmem_page.lock);
-
-    shmem_page.refcount--;
-    if(shmem_page.refcount == 0){
-      kfree((void*)shmem_page.pa);
-      shmem_page.pa = 0;
-      shmem_page.allocated = 0;
-    }
-
-    release(&shmem_page.lock);
+    kfree(mem);
     return 0;
   }
 
-  return SHMEM_REGION;
+  // 5. Record mapping
+  p->mmaps[idx].va = va;
+  p->mmaps[idx].pa = pa;
+  p->mmaps[idx].size = PGSIZE;
+  p->mmaps[idx].used = 1;
+  p->mmaps[idx].refcnt = 1;
+
+  return va;
 }
+
+// int
+// munmap(uint64 addr)
+// {
+//   struct proc *p = myproc();
+
+//   // 1. Validate address
+//   if(addr != SHMEM_REGION)
+//     return -1;
+
+//   // 2. Find PTE
+//   pte_t *pte = walk(p->pagetable, addr, 0);
+//   if(pte == 0)
+//     return -1;
+
+//   // 3. Check if valid and mapped
+//   if((*pte & PTE_V) == 0)
+//     return -1;
+
+//   // 4. Remove mapping (get physical address first)
+//   uint64 pa = PTE2PA(*pte);
+
+//   // Clear the PTE
+//   *pte = 0;
+
+//   // Optional but good practice: flush TLB
+//   sfence_vma();
+
+//   // 5. Update shared memory metadata
+//   acquire(&shmem_page.lock);
+
+//   // Sanity check (optional but safe)
+//   if(shmem_page.allocated == 0 || shmem_page.pa != pa){
+//     release(&shmem_page.lock);
+//     return -1;
+//   }
+
+//   shmem_page.refcount--;
+
+//   // 6. Free if last reference
+//   if(shmem_page.refcount == 0){
+//     kfree((void*)shmem_page.pa);
+//     shmem_page.pa = 0;
+//     shmem_page.allocated = 0;
+//   }
+
+//   release(&shmem_page.lock);
+
+//   return 0;
+// }
+
 
 int
 munmap(uint64 addr)
 {
   struct proc *p = myproc();
 
-  // 1. Validate address
-  if(addr != SHMEM_REGION)
-    return -1;
-
-  // 2. Find PTE
-  pte_t *pte = walk(p->pagetable, addr, 0);
-  if(pte == 0)
-    return -1;
-
-  // 3. Check if valid and mapped
-  if((*pte & PTE_V) == 0)
-    return -1;
-
-  // 4. Remove mapping (get physical address first)
-  uint64 pa = PTE2PA(*pte);
-
-  // Clear the PTE
-  *pte = 0;
-
-  // Optional but good practice: flush TLB
-  sfence_vma();
-
-  // 5. Update shared memory metadata
-  acquire(&shmem_page.lock);
-
-  // Sanity check (optional but safe)
-  if(shmem_page.allocated == 0 || shmem_page.pa != pa){
-    release(&shmem_page.lock);
-    return -1;
+  // 1. Find the mapping
+  int idx = -1;
+  for(int i = 0; i < MAX_MMAP; i++){
+    if(p->mmaps[i].used && p->mmaps[i].va == addr){
+      idx = i;
+      break;
+    }
   }
 
-  shmem_page.refcount--;
+  if(idx == -1)
+    return -1; // not found
 
-  // 6. Free if last reference
-  if(shmem_page.refcount == 0){
-    kfree((void*)shmem_page.pa);
-    shmem_page.pa = 0;
-    shmem_page.allocated = 0;
-  }
+  uint64 va = p->mmaps[idx].va;
+  uint64 pa = p->mmaps[idx].pa;
 
-  release(&shmem_page.lock);
+  // 2. Unmap from this process page table (do NOT free here)
+  uvmunmap(p->pagetable, va, 1, 0);
+
+  // 3. Clear process-local metadata
+  p->mmaps[idx].used = 0;
+  p->mmaps[idx].va = 0;
+  p->mmaps[idx].pa = 0;
+  p->mmaps[idx].size = 0;
+  p->mmaps[idx].refcnt = 0;
+
+  // 4. Free only if no process still maps this physical page.
+  if(pa != 0 && !mmap_pa_in_use(pa))
+    kfree((void*)pa);
 
   return 0;
 }
-

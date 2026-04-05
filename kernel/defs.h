@@ -189,6 +189,7 @@ uint64          sys_mmap(void);
 uint64          sys_munmap(void);
 uint64          mmap(void);
 int             munmap(uint64 va);
+int             mmap_pa_in_use(uint64 pa);
 
 
 // number of elements in fixed-size array

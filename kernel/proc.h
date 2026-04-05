@@ -1,3 +1,15 @@
+
+#define MAX_MMAP 16
+
+struct mmap_region {
+  uint64 va;     // virtual address
+  uint64 pa;     // physical address
+  int size;      // number of bytes (or pages)
+  int used;
+  int refcnt;   // add this
+
+};
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -109,4 +121,6 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  struct mmap_region mmaps[MAX_MMAP];
+
 };

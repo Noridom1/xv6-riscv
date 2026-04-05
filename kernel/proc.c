@@ -19,6 +19,18 @@ struct spinlock pid_lock;
 extern void forkret(void);
 static void freeproc(struct proc *p);
 
+int
+mmap_pa_in_use(uint64 pa)
+{
+  for(struct proc *q = proc; q < &proc[NPROC]; q++){
+    for(int i = 0; i < MAX_MMAP; i++){
+      if(q->mmaps[i].used && q->mmaps[i].pa == pa)
+        return 1;
+    }
+  }
+  return 0;
+}
+
 extern char trampoline[]; // trampoline.S
 
 // helps ensure that wakeups of wait()ing
@@ -161,9 +173,21 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+
+  // ✅ Cleanup mmap regions
+  for(int i = 0; i < MAX_MMAP; i++){
+    if(p->mmaps[i].used){
+      p->mmaps[i].used = 0;
+      p->mmaps[i].va = 0;
+      p->mmaps[i].pa = 0;
+      p->mmaps[i].refcnt = 0;
+    }
+  }
+
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -278,6 +302,12 @@ kfork(void)
     return -1;
   }
   np->sz = p->sz;
+  // ✅ Copy mmap regions from parent to child
+  for(int i = 0; i < MAX_MMAP; i++){
+    if(p->mmaps[i].used){
+      np->mmaps[i] = p->mmaps[i];
+    }
+  }
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
